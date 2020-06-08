@@ -1,0 +1,279 @@
+# Here "roi" is a polygon of the Rio de Janeiro city in Brazil.
+
+//Image collection
+var collectionVH = ee.ImageCollection("COPERNICUS/S1_GRD")
+                  .filter(ee.Filter.eq("instrumentMode", "IW"))
+                  .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VH"))
+                  .filter(ee.Filter.eq("orbitProperties_pass", "DESCENDING"))
+                  .filterMetadata("resolution_meters", "equals", 10)
+                  .filterBounds(roi)
+                  .select(["VH"]);                  
+
+
+
+//Filter by date of the event
+var before_event_VH = collectionVH.filterDate("2019-01-01", "2019-03-31").mosaic();
+var after_event_VH = collectionVH.filterDate("2019-04-15", "2019-04-30").mosaic();
+
+print(before_event_VH, "before VH");
+print(after_event_VH, "after VH");
+
+Map.addLayer(before_event_VH, {min: -20, max:-7}, "Before event VH", 0);              
+Map.addLayer(after_event_VH, {min: -20, max:-7}, "After event VH", 0); 
+
+//Apply speckle filter
+var smooth = 50;
+var before_filtered = before_event_VH.focal_mean(smooth, "circle", "meters");
+var after_filtered = after_event_VH.focal_mean(smooth, "circle", "meters");
+
+
+//................FLOOD EXTENT CALCULATION...........................
+
+//Difference between the events
+var diff = after_filtered.divide(before_filtered);
+
+//Apply threshold for the flooded areas
+var threshold = 1.1;
+var flood_areas = diff.gt(threshold);
+
+//Refine flood calculation using other datasets
+      // Include the JRC layer on surface water seasonality to mask flood pixels from areas
+      // of "permanent" water (where there is water > 10 months of the year)
+
+      var swater = ee.Image("JRC/GSW1_1/GlobalSurfaceWater").select("seasonality");
+      var swater_mask = swater.gte(10).updateMask(swater.gte(10));
+
+      //Flooded layer where perennial water bodies (water > 10 mo/yr) is assigned a 0 value
+      var flood_mask = flood_areas.where(swater_mask,0);
+      // final flooded area without pixels in perennial waterbodies
+      var flooded = flood_mask.updateMask(flood_mask);
+      
+      // Compute connectivity of pixels to eliminate those connected to 8 or fewer neighbours
+      // This operation REDUCES NOISE of the flood extent product 
+      var connections = flooded.connectedPixelCount();
+      var flooded = flooded.updateMask(connections.gt(8));
+      
+      // Mask out areas with more than 5 percent slope using a Digital Elevation Model 
+      var DEM = ee.Image('WWF/HydroSHEDS/03VFDEM');
+      var terrain = ee.Algorithms.Terrain(DEM);
+      var slope = terrain.select('slope');
+      var flooded = flooded.updateMask(slope.lt(5)).clip(roi);
+      
+// Calculate flood extent area
+// Create a raster layer containing the area information of each pixel 
+var flooded_pixelarea = flooded.select(["VH"]).multiply(ee.Image.pixelArea()); 
+    
+// Sum the areas of flooded pixels
+// default is set to 'bestEffort: true' in order to reduce compuation time, for a more 
+// accurate result set bestEffort to false and increase 'maxPixels'
+var flood_stats = flooded_pixelarea.reduceRegion({
+  reducer: ee.Reducer.sum(),              
+  geometry: roi,
+  scale: 10, // native resolution 
+  //maxPixels: 1e9,
+  bestEffort: true
+  });
+      
+// Convert the flood extent to hectares (area calculations are originally given in meters) 
+var flood_area_hec = flood_stats
+                     .getNumber("VH")
+                     .divide(10000)
+                     .round();
+print(flood_area_hec, "Area flooded (in hectares)");
+                     
+
+//................................DAMAGE ASSESSMENT.................................
+
+//..........EXPOSED POPULATION DENSITY...................
+
+var population_count = ee.Image('JRC/GHSL/P2016/POP_GPW_GLOBE_V1/2015').clip(roi);
+var GHSLprojection = population_count.projection();
+
+//Reproject the flood layer to GHSL projection
+var flood_reprojected = flooded.reproject({
+                        crs: GHSLprojection
+                        });
+                        
+// Create a raster showing exposed population only using the resampled flood layer 
+//and update with the population count
+var population_exposed = population_count.updateMask(flood_reprojected)
+                                         .updateMask(population_count);
+
+//Sum pixel values of exposed population raster 
+var pop_stats = population_exposed.reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: roi,
+            scale: 250,
+            maxPixels: 1e9,
+            });
+
+//Get the number of exposed population
+var number_exposed = pop_stats.getNumber("population_count").round();
+print(number_exposed, "Population exposed to the April 2019 Floods");
+
+
+//----------------------------- Affected agricultural land ----------------------------//
+
+// using MODIS Land Cover Type Yearly Global 500m
+// filter image collection by the most up-to-date MODIS Land Cover product 
+
+var LC = ee.ImageCollection("MODIS/006/MCD12Q1")
+            .filterDate("2014-01-01", "2019-04-30")
+            .sort("system_index", false)
+            .select("LC_Type1")
+            .first()
+            .clip(roi);
+
+// Extract only cropland pixels using the classes cropland (>60%) and Cropland/Natural 
+// Vegetation Mosaics: mosaics of small-scale cultivation 40-60% incl. natural vegetation
+var cropmask = LC.eq(12).or(LC.eq(14));
+var cropland = LC.updateMask(cropmask);
+
+//Get the MODIS projection and reproject to the flooded areas
+var modis_projection = LC.projection();
+
+var flooded_reprojected_modis = flooded.reproject({
+                                crs: modis_projection
+                                });
+                                
+// Calculate affected cropland using the resampled flood layer
+var crop_affected = flooded_reprojected_modis.updateMask(cropland);
+
+// get pixel area of affected cropland layer
+var crop_pixelarea = crop_affected.multiply(ee.Image.pixelArea());
+
+//Sum the area pixels
+var LC_stats = crop_pixelarea.reduceRegion({
+               reducer: ee.Reducer.sum(),
+               geometry: roi,
+               scale: 500,
+               maxPixels: 1e9
+              });
+              
+//Calculate and convert the area to hectares
+var crop_flooded_hectare = LC_stats
+                           .getNumber("VH")
+                           .divide(10000)
+                           .round();
+print(crop_flooded_hectare, "Cropland area destroyed (in hectares) ");
+
+
+//-------------------------------- Affected urban area ------------------------------//
+
+// Using the same MODIS Land Cover Product 
+// Filter urban areas
+
+var urbanmask = LC.eq(13);
+var urban = LC.updateMask(urbanmask);
+
+var urban_exposed = urban.mask(flooded_reprojected_modis).updateMask(urban);
+
+//Get the pixel of the urban affected area
+var urban_exposed_pixelarea = urban_exposed.multiply(ee.Image.pixelArea());
+
+//Sum the pixels
+var urban_stats = urban_exposed_pixelarea.reduceRegion({
+                  reducer: ee.Reducer.sum(),
+                  geometry: roi,
+                  scale: 500,
+                  bestEffort: true,
+                  });
+                  
+//Convert and calculate the area in hectares of the urban flooded
+var urban_exposed_area =  urban_stats
+                         .getNumber("LC_Type1")
+                         .divide(10000)
+                         .round();
+print(urban_exposed_area, "Urban area destroyed (in hectares");
+
+
+//------------------------------  DISPLAY PRODUCTS  ----------------------------------//
+
+// Before and after flood SAR mosaic
+Map.centerObject(roi,8);
+Map.addLayer(before_filtered, {min:-25,max:0}, 'Before Flood',0);
+Map.addLayer(after_filtered, {min:-25,max:0}, 'After Flood',0);
+
+// Difference layer
+Map.addLayer(diff,{min:0,max:2},"Difference Layer",0);
+
+// Flooded areas
+Map.addLayer(flooded,{palette:"0000FF"},'Flooded areas');
+
+// Population Density
+var populationCountVis = {
+  min: 0,
+  max: 200.0,
+  palette: ['060606','337663','337663','ffffff'],
+};
+Map.addLayer(population_count, populationCountVis, 'Population Density',0);
+
+// Exposed Population
+var populationExposedVis = {
+  min: 0,
+  max: 200.0,
+  palette: ['yellow', 'orange', 'red'],
+};
+Map.addLayer(population_exposed, populationExposedVis, 'Exposed Population');
+
+// Cropland
+var croplandVis = {
+  min: 0,
+  max: 14.0,
+  palette: ['30b21c'],
+};
+Map.addLayer(cropland, croplandVis, 'Cropland',0);
+
+// Affected cropland
+Map.addLayer(crop_affected, croplandVis, 'Affected Cropland'); 
+
+// Urban
+var urbanVis = {
+  min: 0,
+  max: 13.0,
+  palette: ['grey'],
+};
+Map.addLayer(urban, urbanVis, 'Urban',0);
+
+// Affected urban
+Map.addLayer(urban_exposed_pixelarea, urbanVis, 'Affected Urban'); 
+
+//------------------------------------- EXPORTS ------------------------------------//
+// Export flooded area as TIFF file 
+Export.image.toDrive({
+  image: flooded, 
+  description: 'Flood_extent_raster',
+  fileNamePrefix: 'flooded',
+  region: roi, 
+  maxPixels: 1e10
+});
+
+// Export flooded area as shapefile (for further analysis in e.g. QGIS)
+// Convert flood raster to polygons
+var flooded_vec = flooded.reduceToVectors({
+  scale: 10,
+  geometryType:'polygon',
+  geometry: roi,
+  eightConnected: false,
+  bestEffort:true,
+  tileScale:2,
+});
+
+// Export flood polygons as shape-file
+Export.table.toDrive({
+  collection:flooded_vec,
+  description:'Flood_extent_vector',
+  fileFormat:'SHP',
+  fileNamePrefix:'flooded_vec'
+});
+
+// Export auxcillary data as shp?
+// Exposed population density
+Export.image.toDrive({
+  image:population_exposed,
+  description:'Exposed_Populuation',
+  scale: 250,
+  fileNamePrefix:'population_exposed',
+  region: roi,
+  maxPixels:1e10
+});
