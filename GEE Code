@@ -1,5 +1,6 @@
 //Here "roi" is a polygon of Kasese, a town in Western Uganda.
 //Import Kasese shape file from ArcGIS Online or any other source
+
 var roi = table.geometry();
 Map.centerObject(roi);
 Map.addLayer(roi, {color: "yellow"}, "Kasese", 0);
